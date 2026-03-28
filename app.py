@@ -1,7 +1,7 @@
 import os, asyncio, random, threading, json
 from flask import Flask, render_template_string, request, redirect
-from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.sync import TelegramClient
+from telethon import events
 
 app = Flask(__name__)
 
@@ -15,15 +15,16 @@ if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
 DB_FILE = os.path.join(DATA_DIR, 'bot_config.json')
 def load_db():
     if os.path.exists(DB_FILE):
-        return json.load(open(DB_FILE))
-    return {"msgs": ["Hi! How are you?"], "sent": [], "active": False, "targets": ["english_practice_group"]}
+        try: return json.load(open(DB_FILE))
+        except: pass
+    return {"msgs": ["Hi! Saw you in the group."], "sent": [], "active": False, "targets": []}
 
 db = load_db()
 def save_db():
     with open(DB_FILE, 'w') as f: json.dump(db, f)
 
-# Temp storage for login process
-pending = {}
+# Global for the verify step
+phone_awaiting = None
 
 # --- HTML INTERFACE ---
 HTML = """
@@ -38,24 +39,24 @@ HTML = """
         .btn-blue { background: #40a7e3; color: white; }
         .btn-green { background: #28a745; color: white; }
         .btn-red { background: #dc3545; color: white; }
-        input, textarea { width: 90%; padding: 10px; margin: 10px 0; background: #222; color: white; border: 1px solid #444; }
+        input { width: 90%; padding: 10px; margin: 10px 0; background: #222; color: white; border: 1px solid #444; }
     </style>
 </head>
 <body>
     <div class='card'>
         <h2>Status: <span style='color:{{ "green" if db.active else "red" }}'>{{ "RUNNING" if db.active else "PAUSED" }}</span></h2>
-        <a href='/toggle'><button class='btn {{ "btn-red" if db.active else "btn-green" }}'>{{ "PAUSE BOT" if db.active else "START BOT" }}</button></a>
+        <a href='/toggle'><button class='btn {{ "btn-red" if db.active else "btn-green" }}'>{{ "PAUSE" if db.active else "START" }}</button></a>
     </div>
 
     <div class='card'>
-        <h3>1. Add Account</h3>
+        <h3>Add Account</h3>
         <form action='/send_code' method='post'>
             <input type='text' name='phone' placeholder='+91XXXXXXXXXX' required>
-            <button class='btn btn-blue'>Send Code</button>
+            <button class='btn btn-blue'>Send OTP</button>
         </form>
         {% if phone_wait %}
         <hr>
-        <p>Enter code for {{ phone_wait }}:</p>
+        <p>Enter OTP for {{ phone_wait }}:</p>
         <form action='/verify_code' method='post'>
             <input type='hidden' name='phone' value='{{ phone_wait }}'>
             <input type='text' name='otp' placeholder='12345' required>
@@ -65,15 +66,13 @@ HTML = """
     </div>
 
     <div class='card'>
-        <h3>2. Edit Messages</h3>
+        <h3>Messages</h3>
         {% for m in db.msgs %}
-        <div style='display:flex; justify-content:space-between; margin-bottom:5px;'>
-            <span>{{ m }}</span> <a href='/del_msg/{{ loop.index0 }}' style='color:red;'>[X]</a>
-        </div>
+        <div style='margin-bottom:8px;'>• {{ m }} <a href='/del_msg/{{ loop.index0 }}' style='color:red;'>[X]</a></div>
         {% endfor %}
         <form action='/add_msg' method='post'>
-            <input type='text' name='msg' placeholder='New message...' required>
-            <button class='btn btn-blue'>Add Message</button>
+            <input type='text' name='msg' placeholder='Add message...' required>
+            <button class='btn btn-blue'>Add</button>
         </form>
     </div>
 </body>
@@ -83,31 +82,32 @@ HTML = """
 # --- ROUTES ---
 @app.route('/')
 def index():
-    phone = next(iter(pending), None)
-    return render_template_string(HTML, db=db, phone_wait=phone)
+    global phone_awaiting
+    return render_template_string(HTML, db=db, phone_wait=phone_awaiting)
 
 @app.route('/send_code', methods=['POST'])
 def send_code():
+    global phone_awaiting
     phone = request.form['phone']
     client = TelegramClient(f"{DATA_DIR}/{phone}", API_ID, API_HASH)
-    async def go():
-        await client.connect()
-        h = await client.send_code_request(phone)
-        pending[phone] = {"c": client, "h": h.phone_code_hash}
-    asyncio.run(go())
+    client.connect()
+    client.send_code_request(phone)
+    client.disconnect()
+    phone_awaiting = phone
     return redirect('/')
 
 @app.route('/verify_code', methods=['POST'])
 def verify_code():
+    global phone_awaiting
     phone, otp = request.form['phone'], request.form['otp']
-    async def go():
-        data = pending.get(phone)
-        await data["c"].sign_in(phone, otp, phone_code_hash=data["h"])
-        del pending[phone]
+    client = TelegramClient(f"{DATA_DIR}/{phone}", API_ID, API_HASH)
     try:
-        asyncio.run(go())
+        client.connect()
+        client.sign_in(phone, otp)
+        client.disconnect()
+        phone_awaiting = None
     except Exception as e:
-        return f"Error: {e}. Try again."
+        return f"Verify Error: {e}. <a href='/'>Go Back</a>"
     return redirect('/')
 
 @app.route('/add_msg', methods=['POST'])
@@ -128,42 +128,61 @@ def toggle():
     save_db()
     return redirect('/')
 
-# --- BACKGROUND BOT ---
-async def bot_task():
-    while True:
-        if not db["active"]:
-            await asyncio.sleep(5)
-            continue
-        
-        sessions = [f.replace('.session','') for f in os.listdir(DATA_DIR) if f.endswith('.session')]
-        if not sessions:
-            await asyncio.sleep(10)
-            continue
-            
-        # Use first account as listener
-        listener = TelegramClient(f"{DATA_DIR}/{sessions[0]}", API_ID, API_HASH)
-        await listener.start()
-        
-        @listener.on(events.NewMessage(incoming=True))
-        async def handler(event):
-            if not db["active"] or not event.is_group: return
-            
-            sender = await event.get_sender()
-            if not sender or sender.bot or sender.id in db["sent"]: return
-            
-            # Logic to skip admins and your group members goes here
-            acc = random.choice(sessions)
-            async with TelegramClient(f"{DATA_DIR}/{acc}", API_ID, API_HASH) as s:
+# --- BACKGROUND AUTOMATION ---
+def start_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def run():
+        while True:
+            if not db["active"]:
+                await asyncio.sleep(10)
+                continue
+
+            sessions = [f.replace('.session','') for f in os.listdir(DATA_DIR) if f.endswith('.session')]
+            if not sessions:
+                await asyncio.sleep(10)
+                continue
+
+            # listener uses the first logged-in account
+            client = TelegramClient(f"{DATA_DIR}/{sessions[0]}", API_ID, API_HASH)
+            await client.start()
+
+            @client.on(events.NewMessage(incoming=True))
+            async def handler(event):
+                if not db["active"] or not event.is_group: return
+                
+                # Check target groups
+                chat = await event.get_chat()
+                sender = await event.get_sender()
+                
+                # SMART FILTERS:
+                # 1. No bots/admins
+                # 2. No repeat messaging
+                # 3. Not in your own hub
+                if not sender or sender.bot or sender.id in db["sent"]: return
+                if getattr(chat, 'username', '') == 'global_chattinghub': return
+
                 try:
-                    await s.send_message(sender.id, random.choice(db["msgs"]))
-                    db["sent"].append(sender.id)
-                    save_db()
-                    await asyncio.sleep(60)
+                    p = await client.get_permissions(event.chat_id, sender.id)
+                    if p.is_admin: return
                 except: pass
 
-        await listener.run_until_disconnected()
+                # Choose random sender account
+                acc = random.choice(sessions)
+                async with TelegramClient(f"{DATA_DIR}/{acc}", API_ID, API_HASH) as s:
+                    try:
+                        await s.send_message(sender.id, random.choice(db["msgs"]))
+                        db["sent"].append(sender.id)
+                        save_db()
+                        await asyncio.sleep(random.randint(60, 120))
+                    except: pass
+
+            await client.run_until_disconnected()
+
+    loop.run_until_complete(run())
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: asyncio.run(bot_task())).start()
+    threading.Thread(target=start_bot_thread, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
     
